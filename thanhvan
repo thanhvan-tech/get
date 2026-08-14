@@ -1,0 +1,648 @@
+#!/usr/bin/env bash
+#
+# thanhvan -- one front door to gcloud, gh, tailscale and cloudflared.
+#
+# This script IS the CLI. It installs nothing, authenticates nothing and knows
+# nothing about any of the four services; it composes one `docker run` and gets
+# out of the way. Everything a user can actually do lives in the image.
+#
+# ===========================================================================
+# WRITE FOR BASH 3.2.
+#
+# macOS ships 3.2.57 (2007) as /bin/bash and always will -- bash 4 went GPLv3.
+# So: no associative arrays, no ${x,,}, no mapfile, no &>>, no negative array
+# indices, no `local -n`. Indexed arrays and ${!var} are fine, both predate 3.2.
+#
+# Ubuntu has bash 5 and accepts all of the above, which is exactly why this is
+# easy to get wrong: it works on the machine you tested and breaks on the other.
+# ===========================================================================
+#
+# ===========================================================================
+# TWO INVARIANTS, BOTH GUARDED IN CI, NEITHER OF WHICH FAILS LOUDLY IF BROKEN:
+#
+#  1. NO BIND MOUNTS, EVER. Not the cwd, not $HOME, not one host path. All state
+#     lives in the named volume, which is the only writable thing the container
+#     can see and which `docker volume rm` removes completely. That is what
+#     makes "thanhvan touched nothing on my laptop" a true statement and what
+#     makes uninstall a real operation instead of a hunt through four dotfile
+#     directories.
+#
+#  2. NO ADDED PRIVILEGES. No --privileged, --cap-add, --device, --network=host,
+#     --security-opt, no docker.sock. tailscaled runs with
+#     --tun=userspace-networking, which needs none of them.
+#
+# A change that violates either one still works perfectly on the machine you
+# test it on. That is the whole problem.
+# ===========================================================================
+
+set -u
+
+THANHVAN_VERSION="0.4.0"
+
+IMAGE_REPO="ghcr.io/thanhvan-tech/thanhvan"
+DEFAULT_VOLUME="thanhvan-home"
+CHOME="/home/thanhvan"
+
+# Host environment forwarded into the container. AN ALLOWLIST, and deliberately
+# tiny. Forwarding the environment wholesale would put whatever the host happens
+# to be holding -- GITHUB_TOKEN, AWS_SECRET_ACCESS_KEY, a CI job's injected
+# secrets -- into `docker run`'s argv, which every user on the machine can read
+# through ps(1) for the lifetime of the call. Adding a name to this list is a
+# security decision, not a convenience one.
+FORWARD_ENV="TERM NO_COLOR HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy"
+
+# The four verbs. Each is a vendor CLI; `tailscale` is the one that needs a
+# wrapper, because its CLI is useless without a daemon (see docker/tv-tailscale.sh).
+PASSTHROUGH_VERBS="gcloud gh tailscale cloudflared"
+
+TV_DRY_RUN=0
+TV_QUIET=0
+TV_YES=0
+
+# --- self-resolution ------------------------------------------------------
+# Installed, this file is reached through two symlink hops:
+#
+#   ~/.local/bin/thanhvan -> ~/.local/share/thanhvan/current/bin/thanhvan
+#                         -> ~/.local/share/thanhvan/versions/<v>/bin/thanhvan
+#
+# so `dirname "$0"` yields ~/.local/bin and every path derived from it is wrong.
+# `readlink -f` does not exist on macOS < 12.3 and BSD `realpath` has no -f, so
+# walk the chain by hand. This works perfectly from a checkout and breaks every
+# installed run, which is the worst way to be wrong -- CI drives the real
+# symlink chain because of it.
+_self="$0"
+while [ -L "$_self" ]; do
+  _dir=$(cd -P "$(dirname "$_self")" && pwd)
+  _self=$(readlink "$_self")
+  case "$_self" in
+    /*) ;;                     # absolute target, use as-is
+    *) _self="$_dir/$_self" ;; # relative target, resolve against the link's dir
+  esac
+done
+BIN_DIR=$(cd -P "$(dirname "$_self")" && pwd)
+CLI_ROOT=$(cd -P "$BIN_DIR/.." && pwd)
+
+if [ -d "$CLI_ROOT/.git" ]; then TV_MODE="dev"; else TV_MODE="installed"; fi
+
+# --- output ---------------------------------------------------------------
+
+if [ -t 2 ]; then
+  C_DIM=$'\033[2m'; C_RED=$'\033[31m'; C_YEL=$'\033[33m'
+  C_GRN=$'\033[32m'; C_BOLD=$'\033[1m'; C_OFF=$'\033[0m'
+else
+  C_DIM=''; C_RED=''; C_YEL=''; C_GRN=''; C_BOLD=''; C_OFF=''
+fi
+
+# Chrome on stderr, data on stdout, so `thanhvan gh api user | jq` works.
+say()     { [ "$TV_QUIET" = "1" ] || printf '%s\n' "$*" >&2; }
+heading() { [ "$TV_QUIET" = "1" ] || printf '\n%s%s%s\n' "$C_BOLD" "$*" "$C_OFF" >&2; }
+ok()      { [ "$TV_QUIET" = "1" ] || printf '  %s+%s %s\n' "$C_GRN" "$C_OFF" "$*" >&2; }
+miss()    { [ "$TV_QUIET" = "1" ] || printf '  %s-%s %s\n' "$C_RED" "$C_OFF" "$*" >&2; }
+skip()    { [ "$TV_QUIET" = "1" ] || printf '  %s.%s %s\n' "$C_DIM" "$C_OFF" "$*" >&2; }
+bullet()  { [ "$TV_QUIET" = "1" ] || printf '    %s-%s %s\n' "$C_DIM" "$C_OFF" "$*" >&2; }
+warn()    { printf '%swarning:%s %s\n' "$C_YEL" "$C_OFF" "$*" >&2; }
+
+# Errors name the exact command that fixes them. These often surface in a CI log
+# where there is nobody to ask a follow-up question.
+die() { printf '%serror:%s %s\n' "$C_RED" "$C_OFF" "$1" >&2; shift
+        for _l in "$@"; do printf '  %s\n' "$_l" >&2; done
+        exit 1; }
+
+confirm() {
+  # question, default(y|n). --yes answers yes. Non-interactive answers with the
+  # default, and every destructive caller passes n -- so an unattended run that
+  # forgot --yes changes nothing rather than guessing.
+  [ "$TV_YES" = "1" ] && return 0
+  [ -t 0 ] || { [ "${2:-n}" = "y" ]; return $?; }
+  # reply is initialised, not merely declared: `local reply` leaves it UNSET, and
+  # `set -u` aborts on the first read of an unset variable.
+  local suffix reply=""
+  if [ "${2:-n}" = "y" ]; then suffix="[Y/n]"; else suffix="[y/N]"; fi
+  printf '  %s %s ' "$1" "$suffix" >&2
+  read -r reply || return 1
+  [ -z "$reply" ] && { [ "${2:-n}" = "y" ]; return $?; }
+  case "$reply" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+confirm_phrase() {
+  # Reserved for what cannot be undone. A y/N prompt gets answered reflexively;
+  # typing a word does not. Never passes non-interactively, --yes included.
+  [ -t 0 ] || return 1
+  local reply=""
+  printf '  %s\n  Type %s%s%s to continue: ' "$1" "$C_BOLD" "$2" "$C_OFF" >&2
+  read -r reply || return 1
+  [ "$reply" = "$2" ]
+}
+
+# --- machine detection ----------------------------------------------------
+
+detect() {
+  case "$(uname -s)" in
+    Darwin) TV_OS="macos" ;;
+    Linux)
+      TV_OS="linux"
+      if [ -r /etc/os-release ]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        case "${ID:-}" in
+          ubuntu|debian) TV_OS="$ID" ;;
+          *) case " ${ID_LIKE:-} " in *" debian "*|*" ubuntu "*) TV_OS="debian" ;; esac ;;
+        esac
+      fi ;;
+    *) TV_OS="unknown" ;;
+  esac
+
+  case "$(uname -m)" in
+    arm64|aarch64) TV_ARCH="arm64" ;;
+    x86_64|amd64)  TV_ARCH="amd64" ;;
+    *) TV_ARCH="$(uname -m)" ;;
+  esac
+
+  # The LOGIN shell, not this one -- $SHELL is what the user gets in a new
+  # terminal, which is where the PATH block has to take effect.
+  TV_SHELL="$(basename "${SHELL:-}")"
+  case "$TV_SHELL" in
+    zsh)  TV_RC="$HOME/.zshrc" ;;
+    bash) if [ "$TV_OS" = "macos" ]; then TV_RC="$HOME/.bash_profile"; else TV_RC="$HOME/.bashrc"; fi ;;
+    *)    TV_RC="" ;;
+  esac
+
+  # Not a terminal means nobody can answer a prompt, whether or not $CI is set.
+  if [ -n "${CI:-}" ] || [ -n "${GITHUB_ACTIONS:-}" ] || [ ! -t 0 ]; then
+    TV_CI=1
+  else
+    TV_CI=0
+  fi
+}
+
+image_ref() { printf '%s' "${THANHVAN_IMAGE:-$IMAGE_REPO:$THANHVAN_VERSION}"; }
+volume_name() { printf '%s' "${THANHVAN_VOLUME:-$DEFAULT_VOLUME}"; }
+
+detect_report() {
+  detect
+  printf 'os=%s\n'       "$TV_OS"
+  printf 'arch=%s\n'     "$TV_ARCH"
+  printf 'shell=%s\n'    "$TV_SHELL"
+  printf 'rc=%s\n'       "$TV_RC"
+  printf 'ci=%s\n'       "$TV_CI"
+  printf 'mode=%s\n'     "$TV_MODE"
+  printf 'cli_root=%s\n' "$CLI_ROOT"
+  printf 'version=%s\n'  "$THANHVAN_VERSION"
+  printf 'image=%s\n'    "$(image_ref)"
+  printf 'volume=%s\n'   "$(volume_name)"
+}
+
+# --- the shell PATH block -------------------------------------------------
+# A marked block, rewritten by sed range-delete then append, so re-running
+# replaces it rather than stacking a second copy.
+
+BLOCK_BEGIN="# >>> thanhvan >>>"
+BLOCK_END="# <<< thanhvan <<<"
+
+write_shell_block() {
+  detect
+  [ -n "$TV_RC" ] || return 0
+  # A CI runner has no interactive shell to fix, and editing a profile there is
+  # pure surprise.
+  [ "$TV_CI" = "1" ] && return 0
+
+  local bindir="$HOME/.local/bin"
+  case ":$PATH:" in *":$bindir:"*) return 0 ;; esac
+
+  remove_shell_block
+  {
+    printf '\n%s\n' "$BLOCK_BEGIN"
+    # $PATH must reach the rc file literally, not expanded at write time.
+    # shellcheck disable=SC2016
+    printf 'export PATH="%s:$PATH"\n' "$bindir"
+    printf '%s\n' "$BLOCK_END"
+  } >> "$TV_RC"
+  ok "added $bindir to PATH in $TV_RC"
+}
+
+remove_shell_block() {
+  detect
+  [ -n "$TV_RC" ] || return 0
+  [ -f "$TV_RC" ] || return 0
+  grep -qF "$BLOCK_BEGIN" "$TV_RC" 2>/dev/null || return 0
+  local tmp
+  tmp="$TV_RC.thanhvan.$$"
+  sed "/^${BLOCK_BEGIN}\$/,/^${BLOCK_END}\$/d" "$TV_RC" > "$tmp" && mv -f "$tmp" "$TV_RC"
+}
+
+# --- docker ---------------------------------------------------------------
+
+require_docker() {
+  # TWO problems, TWO fixes, and conflating them sends people to the wrong one.
+  # Telling somebody who has Docker Desktop installed but closed to "install
+  # Docker" costs them an afternoon.
+  if ! command -v docker >/dev/null 2>&1; then
+    detect
+    if [ "$TV_OS" = "macos" ]; then
+      die "docker is not installed." \
+          "thanhvan runs every tool in a container so that nothing is installed on" \
+          "this machine. Docker is the one exception, and the only prerequisite." \
+          "" \
+          "  brew install --cask docker      (or orbstack, or colima)"
+    fi
+    die "docker is not installed." \
+        "thanhvan runs every tool in a container so that nothing is installed on" \
+        "this machine. Docker is the one exception, and the only prerequisite." \
+        "" \
+        "  https://docs.docker.com/engine/install/"
+  fi
+
+  if ! docker info >/dev/null 2>&1; then
+    detect
+    if [ "$TV_OS" = "macos" ]; then
+      die "docker is installed, but its daemon is not reachable." \
+          "Start it and try again:  open -a Docker"
+    fi
+    die "docker is installed, but its daemon is not reachable." \
+        "Start it:            sudo systemctl start docker" \
+        "If that says permission denied, add yourself to the docker group:" \
+        "                     sudo usermod -aG docker \$USER   (then log out and back in)"
+  fi
+}
+
+ensure_volume() {
+  local name; name="$(volume_name)"
+  if docker volume inspect "$name" >/dev/null 2>&1; then
+    return 0
+  fi
+  [ "$TV_DRY_RUN" = "1" ] && { say "dry-run: docker volume create $name"; return 0; }
+  # `docker run -v name:path` would create it implicitly, unlabelled. Creating it
+  # here means `docker volume ls --filter label=app=thanhvan` finds everything
+  # thanhvan owns, which is what makes a clean uninstall possible at all.
+  docker volume create --label app=thanhvan "$name" >/dev/null \
+    || die "could not create the docker volume '$name'."
+}
+
+image_present() { docker image inspect "$(image_ref)" >/dev/null 2>&1; }
+
+require_image() {
+  image_present && return 0
+  [ "$TV_DRY_RUN" = "1" ] && return 0
+  # Deliberately does NOT pull. A silent ~700MB download in the middle of
+  # `thanhvan gcloud config list` is not something anyone should have to work out
+  # from a stalled terminal.
+  die "the thanhvan tool image is not present ($(image_ref))." \
+      "Pull it:  thanhvan setup workstation"
+}
+
+pull_image() {
+  if [ "$TV_DRY_RUN" = "1" ]; then say "dry-run: docker pull $(image_ref)"; return 0; fi
+  docker pull "$(image_ref)" || die "could not pull $(image_ref)." \
+    "If this is a private registry you are not logged in to:  docker login ghcr.io"
+}
+
+quoted() {
+  # Display-only shell quoting, for --dry-run and -v traces.
+  local out="" a
+  for a in "$@"; do
+    case "$a" in
+      *[!A-Za-z0-9_./:=-]*|'') out="$out '$(printf '%s' "$a" | sed "s/'/'\\\\''/g")'" ;;
+      *) out="$out $a" ;;
+    esac
+  done
+  printf '%s' "${out# }"
+}
+
+# THE ONLY PLACE A CONTAINER IS STARTED.
+#
+# Every flag below is part of the security boundary, and CI asserts that this
+# function is the single site that has one. Do not add a second.
+docker_run() {
+  local -a args
+  args=( --rm )
+
+  # -i always; -t only when BOTH ends are a terminal. Two different failures,
+  # one on each side:
+  #
+  #   -t with a redirected stdin -- `thanhvan gcloud ... < /dev/null`, or any CI
+  #      run -- makes docker refuse outright: "the input device is not a TTY".
+  #
+  #   -t with a redirected stdout allocates a pty, and a pty rewrites every \n
+  #      as \r\n. So `thanhvan gcloud ... --format=json | jq` fails on carriage
+  #      returns inside the JSON, which reads as a gcloud bug and is not one.
+  #
+  # -i is kept in every case, so `echo y | thanhvan gcloud ...` still works.
+  if [ -t 0 ] && [ -t 1 ]; then args+=( -i -t ); else args+=( -i ); fi
+
+  # --init: the tailscale wrapper leaves a background tailscaled behind, and
+  #   without an init to reap it the container outlives the command.
+  # --hostname: otherwise tailscaled registers a NEW device named after each
+  #   container id, and the tailnet slowly fills with one-shot nodes.
+  args+=( --init --hostname thanhvan )
+
+  # The only mount. A named volume, never a host path.
+  args+=( -v "$(volume_name):$CHOME" -w "$CHOME" )
+
+  local name value
+  for name in $FORWARD_ENV; do
+    value="${!name:-}"
+    [ -n "$value" ] && args+=( -e "$name=$value" )
+  done
+
+  args+=( "$(image_ref)" "$@" )
+
+  if [ "$TV_DRY_RUN" = "1" ]; then
+    say "dry-run: docker run $(quoted "${args[@]}")"
+    return 0
+  fi
+  [ "${TV_TRACE:-0}" = "1" ] && say "$C_DIM\$$C_OFF docker run $(quoted "${args[@]}")"
+
+  docker run "${args[@]}"
+}
+
+# --- passthrough ----------------------------------------------------------
+
+is_verb() {
+  local v
+  for v in $PASSTHROUGH_VERBS; do [ "$1" = "$v" ] && return 0; done
+  return 1
+}
+
+binary_for() {
+  # tailscale is the only verb whose binary is not itself: the CLI cannot do
+  # anything without a daemon, so it goes through a wrapper that starts one.
+  case "$1" in
+    tailscale) printf 'tv-tailscale' ;;
+    *)         printf '%s' "$1" ;;
+  esac
+}
+
+run_passthrough() {
+  local verb="$1"; shift
+  require_docker
+  ensure_volume
+  require_image
+  docker_run "$(binary_for "$verb")" "$@"
+}
+
+# --- setup workstation ----------------------------------------------------
+
+# Each check reads what the tool itself reports, never a marker file recording
+# that setup once ran. A marker goes stale the moment somebody runs
+# `docker image prune` or `docker volume rm`, and it fails as a false OK.
+gcloud_account() { docker_run gcloud auth list --filter=status:ACTIVE --format="value(account)" 2>/dev/null | tr -d '\r'; }
+gcloud_adc_ok()  { docker_run gcloud auth application-default print-access-token >/dev/null 2>&1; }
+gh_login_name()  { docker_run gh api user --jq .login 2>/dev/null | tr -d '\r'; }
+ts_state()       { docker_run tv-tailscale status --json 2>/dev/null | tr -d '\r' | sed -n 's/.*"BackendState"[ ]*:[ ]*"\([A-Za-z]*\)".*/\1/p' | head -1; }
+cf_cert_ok()     { docker_run test -f "$CHOME/.cloudflared/cert.pem" >/dev/null 2>&1; }
+
+setup_logins() {
+  local interactive=1
+  [ -t 0 ] || interactive=0
+
+  heading "Google"
+  local account; account="$(gcloud_account)"
+  if [ -n "$account" ]; then
+    ok "signed in as $account"
+  else
+    miss "not signed in"
+    if [ "$interactive" = "1" ]; then
+      # --no-launch-browser, NOT --no-browser. The latter prints a
+      # `gcloud auth login --remote-bootstrap=...` command to run on a machine
+      # that already has gcloud and a browser -- and the entire point of this
+      # design is that this machine has no gcloud. --no-launch-browser prints a
+      # URL and waits on stdin for the code, which is what a pty gives us.
+      docker_run gcloud auth login --no-launch-browser || warn "gcloud sign-in did not complete."
+    else
+      bullet "Run 'thanhvan setup workstation' from a terminal to sign in."
+    fi
+  fi
+
+  if gcloud_adc_ok; then
+    ok "Application Default Credentials present"
+  else
+    miss "no Application Default Credentials"
+    # The step the runbook loses most often. `gcloud auth login` writes the
+    # CLI's own credentials; `gcloud auth application-default login` writes the
+    # ADC that libraries and Terraform actually read. Two commands, both needed,
+    # and the first one succeeding tells you nothing about the second.
+    bullet "Separate from the sign-in above, and easy to miss: anything using a"
+    bullet "Google client library reads ADC, not the CLI's own credentials."
+    if [ "$interactive" = "1" ]; then
+      docker_run gcloud auth application-default login --no-launch-browser \
+        || warn "application-default login did not complete."
+    fi
+  fi
+
+  heading "GitHub"
+  local who; who="$(gh_login_name)"
+  if [ -n "$who" ]; then
+    ok "authenticated as $who"
+  else
+    miss "not authenticated"
+    if [ "$interactive" = "1" ]; then
+      # --web picks the device flow directly and skips the "how would you like to
+      # authenticate" menu, which cannot be navigated usefully here.
+      # --git-protocol https avoids the SSH-keygen branch, which would generate a
+      # key inside the volume that nothing ever uses.
+      docker_run gh auth login --hostname github.com --git-protocol https --web \
+        || warn "GitHub sign-in did not complete."
+    else
+      bullet "Run 'thanhvan setup workstation' from a terminal to sign in."
+    fi
+  fi
+
+  heading "Tailscale"
+  local state; state="$(ts_state)"
+  if [ "$state" = "Running" ]; then
+    ok "logged in"
+  else
+    miss "not logged in${state:+ ($state)}"
+    bullet "The container joins the tailnet; this machine does not."
+    if [ "$interactive" = "1" ]; then
+      docker_run tv-tailscale login || warn "Tailscale login did not complete."
+    fi
+  fi
+
+  heading "Cloudflare"
+  if cf_cert_ok; then
+    ok "origin certificate present"
+  else
+    miss "no origin certificate"
+    if [ "$interactive" = "1" ]; then
+      docker_run cloudflared tunnel login || warn "cloudflared login did not complete."
+    fi
+  fi
+}
+
+setup_workstation() {
+  local do_login=1 do_pull=0 do_uninstall=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --skip-login) do_login=0; shift ;;
+      --pull)       do_pull=1;  shift ;;
+      --uninstall)  do_uninstall=1; shift ;;
+      *) die "unknown option '$1' for 'setup workstation'." \
+             "Try: thanhvan setup workstation [--skip-login] [--pull] [--uninstall]" ;;
+    esac
+  done
+
+  [ "$do_uninstall" = "1" ] && { uninstall; return $?; }
+
+  detect
+  heading "Machine"
+  ok "os               $TV_OS/$TV_ARCH"
+  ok "mode             $TV_MODE"
+  ok "image            $(image_ref)"
+  ok "volume           $(volume_name)"
+
+  heading "Docker"
+  require_docker
+  ok "daemon reachable"
+  ensure_volume
+  ok "volume $(volume_name)"
+
+  if [ "$do_pull" = "1" ] || ! image_present; then
+    if [ "$do_pull" = "0" ]; then
+      miss "image not present"
+      bullet "About 700MB, once. Everything the four CLIs need is in it."
+    fi
+    pull_image
+  fi
+  ok "image $(image_ref)"
+
+  if [ "$do_login" = "1" ]; then
+    setup_logins
+  else
+    heading "Logins"
+    skip "--skip-login"
+  fi
+
+  write_shell_block
+
+  heading "Next"
+  bullet "thanhvan gcloud projects list"
+  bullet "thanhvan gh api user"
+  bullet "thanhvan tailscale status"
+  bullet "thanhvan cloudflared tunnel list"
+  detect
+  [ -n "$TV_RC" ] && bullet "Reload your shell:  exec $TV_SHELL -l"
+
+  # Blockers are reported, never raised: a service that could not be reached is
+  # somebody else's problem to unblock, and exiting non-zero would read as "the
+  # command is broken" on a first run when nothing is broken.
+  return 0
+}
+
+uninstall() {
+  heading "Uninstall"
+  remove_shell_block
+  ok "removed the PATH block"
+
+  local name; name="$(volume_name)"
+  if command -v docker >/dev/null 2>&1 && docker volume inspect "$name" >/dev/null 2>&1; then
+    warn "the volume '$name' holds every credential you have signed in with:"
+    bullet "gcloud credentials and ADC, the gh token, the tailnet node key,"
+    bullet "and the cloudflared origin certificate."
+    bullet "Removing it means signing in to all four again."
+    if confirm_phrase "Delete the volume and every stored credential?" "delete"; then
+      docker volume rm "$name" >/dev/null && ok "removed volume $name"
+    else
+      skip "kept volume $name"
+    fi
+  fi
+
+  bullet "Left in place on purpose: the image (docker rmi $(image_ref) to remove it)"
+  bullet "and Docker itself."
+  return 0
+}
+
+# --- usage ----------------------------------------------------------------
+
+usage() {
+  cat >&2 <<EOF
+${C_BOLD}thanhvan${C_OFF} -- one front door to gcloud, gh, tailscale and cloudflared.
+
+Every tool runs in a container. Nothing but Docker is installed on this machine,
+no host directory is mounted, and all credentials live in the '$(volume_name)'
+docker volume.
+
+${C_BOLD}usage${C_OFF}
+  thanhvan setup workstation [--skip-login] [--pull] [--uninstall]
+  thanhvan gcloud      <args...>
+  thanhvan gh          <args...>
+  thanhvan tailscale   <args...>
+  thanhvan cloudflared <args...>
+
+${C_BOLD}examples${C_OFF}
+  thanhvan setup workstation          pull the image and sign in to all four
+  thanhvan gcloud projects list
+  thanhvan gh pr list
+  thanhvan tailscale status
+  thanhvan cloudflared tunnel list
+
+${C_BOLD}options${C_OFF}
+  Global flags go BEFORE the verb; everything after a verb belongs to that tool.
+
+  -n, --dry-run     print the docker command, start nothing
+  -q, --quiet       only warnings and errors
+  -y, --yes         assume yes (never accepts a typed-phrase confirmation)
+      --version     print the version
+      --detect      print what this machine looks like, machine-readably
+
+${C_BOLD}notes${C_OFF}
+  Because no host directory is mounted, flags that read a local file cannot see
+  it: 'thanhvan gcloud auth activate-service-account --key-file=./sa.json' will
+  not find sa.json. That is the direct cost of not touching your machine.
+EOF
+}
+
+# --- dispatch -------------------------------------------------------------
+#
+# THE BOUNDARY IS THE VERB. Everything before it is thanhvan's; everything after
+# it is handed to the vendor CLI verbatim -- not parsed, not filtered, not
+# reordered. That is the only rule under which
+#
+#     thanhvan gcloud compute instances list --format=json -v
+#
+# can mean what it says. The previous CLI hoisted global flags out of anywhere in
+# the line, which would have silently eaten that -v and turned it into thanhvan
+# verbosity.
+#
+# The cost, and it is the right one: `thanhvan gcloud ... --dry-run` is gcloud's
+# flag, not ours. A flag that belongs sometimes to one program and sometimes to
+# another is unguessable, and all four vendors define flags that collide.
+
+main() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -n|--dry-run) TV_DRY_RUN=1; shift ;;
+      -q|--quiet)   TV_QUIET=1;   shift ;;
+      -y|--yes)     TV_YES=1;     shift ;;
+      -v|--verbose) TV_TRACE=1;   shift ;;
+      *) break ;;
+    esac
+  done
+
+  local cmd="${1:-}"
+
+  if [ -n "$cmd" ] && is_verb "$cmd"; then
+    shift
+    run_passthrough "$cmd" "$@"
+    return $?
+  fi
+
+  case "$cmd" in
+    setup)
+      shift
+      case "${1:-}" in
+        workstation) shift; setup_workstation "$@" ;;
+        '') die "setup what?" "Try: thanhvan setup workstation" ;;
+        *)  die "cannot set up '$1'." "The only target is: thanhvan setup workstation" ;;
+      esac ;;
+    --version|-V) printf 'thanhvan %s\n' "$THANHVAN_VERSION" ;;
+    --detect)     detect_report ;;
+    --uninstall-shell-block) remove_shell_block ;;
+    ''|--help|-h|help) usage ;;
+    *) die "unknown command '$cmd'." \
+           "The tools are: gcloud, gh, tailscale, cloudflared" \
+           "Try: thanhvan --help" ;;
+  esac
+}
+
+main "$@"
