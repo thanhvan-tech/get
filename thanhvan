@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# thanhvan -- one front door to gcloud, gh, tailscale and cloudflared.
+# thanhvan -- one front door to gcloud, gh, tailscale, cloudflared, ssh, kubectl.
 #
 # This script IS the CLI. It installs nothing, authenticates nothing and knows
 # nothing about any of the four services; it composes one `docker run` and gets
@@ -27,6 +27,15 @@
 #     makes uninstall a real operation instead of a hunt through four dotfile
 #     directories.
 #
+#     `container cp`, --push and --pull are NOT an exception to this and must
+#     never become one. No host path is mounted; THIS SCRIPT, running on the
+#     host, reads a file the user named and streams its bytes over the
+#     container's stdin. The container gains no ability to see the host
+#     filesystem -- only bytes the user asked for, by name, in the command they
+#     typed. The moment a path the user did not type is read, or a mount is
+#     added "to make cp faster", that property is gone and nothing at runtime
+#     notices.
+#
 #  2. NO ADDED PRIVILEGES. No --privileged, --cap-add, --device, --network=host,
 #     --security-opt, no docker.sock. tailscaled runs with
 #     --tun=userspace-networking, which needs none of them.
@@ -37,7 +46,7 @@
 
 set -u
 
-THANHVAN_VERSION="0.4.0"
+THANHVAN_VERSION="0.5.0"
 
 IMAGE_REPO="ghcr.io/thanhvan-tech/thanhvan"
 DEFAULT_VOLUME="thanhvan-home"
@@ -51,13 +60,31 @@ CHOME="/home/thanhvan"
 # security decision, not a convenience one.
 FORWARD_ENV="TERM NO_COLOR HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy"
 
-# The four verbs. Each is a vendor CLI; `tailscale` is the one that needs a
-# wrapper, because its CLI is useless without a daemon (see docker/tv-tailscale.sh).
-PASSTHROUGH_VERBS="gcloud gh tailscale cloudflared"
+# The verbs. Each is a vendor CLI. `tailscale` and `ssh` are the two that need a
+# wrapper: the tailscale CLI is useless without a daemon, and ssh cannot reach a
+# tailnet address without one either. See docker/tv-net.sh.
+PASSTHROUGH_VERBS="gcloud gh tailscale cloudflared ssh kubectl"
+
+# Where --push lands and `container cp tv:...` defaults to. Relative to $CHOME,
+# which is also the container's working directory -- so a vendor command can
+# refer to a pushed file as `data/sa.json` and have it resolve.
+DATA_DIR="data"
 
 TV_DRY_RUN=0
 TV_QUIET=0
 TV_YES=0
+TV_TAILNET=0
+TV_FORCE=0
+TV_RECURSE=0
+
+# Newline-delimited, one `src[:dest]` per line. Not arrays: these are read back
+# in run_passthrough, and bash 3.2 has no `local -n` to pass an array by name.
+# Initialised, not merely declared -- `set -u` aborts on the first read of an
+# unset variable, and both of these are read on every passthrough call.
+TV_PUSH=""
+TV_PULL=""
+NL='
+'
 
 # --- self-resolution ------------------------------------------------------
 # Installed, this file is reached through two symlink hops:
@@ -355,6 +382,372 @@ docker_run() {
   docker run "${args[@]}"
 }
 
+# --- moving data in and out -----------------------------------------------
+#
+# THE BYTES GO OVER stdin/stdout. THEY NEVER GO OVER argv.
+#
+# `docker run`'s argv is readable through ps(1) by every user on the machine for
+# the lifetime of the call. That is why FORWARD_ENV is an allowlist rather than
+# the environment; the identical argument applies to file CONTENTS, and harder,
+# because the files this moves are SSH private keys and kubeconfigs. So nothing
+# below ever interpolates a file into a command line -- a `$(cat ...)` anywhere
+# in this script is the bug, and CI greps for it.
+#
+# docker_run allocates a pty only when BOTH stdin and stdout are terminals. Every
+# copy below has one or the other redirected, so none of them gets one -- which
+# matters more here than anywhere else in this file: a pty rewrites every \n as
+# \r\n, and that silently corrupts any binary this moves.
+
+# Reject a container-side path that is not plainly under $CHOME.
+#
+# docker/tv-cp.sh checks this again, and the duplication is the point: this copy
+# fails BEFORE a container is started, so a typo costs nothing and the error is
+# immediate, while that one holds however tv-cp is reached.
+check_rel() {
+  local p="$1" rest c
+  [ -n "$p" ] || die "empty container path." \
+    "Container paths are relative to $CHOME, e.g. tv:$DATA_DIR/sa.json"
+  case "$p" in
+    /*) die "'$p' is an absolute container path." \
+            "Container paths are relative to $CHOME, e.g. tv:$DATA_DIR/sa.json" ;;
+  esac
+  # Component-wise, not a substring test: '..foo' is an ordinary file name, and a
+  # guard that rejects it is one people work around rather than fix.
+  rest="$p"
+  while [ -n "$rest" ]; do
+    c="${rest%%/*}"
+    [ "$c" = ".." ] && die "'$p' contains a '..' component." \
+                           "Container paths must stay inside $CHOME."
+    case "$rest" in
+      */*) rest="${rest#*/}" ;;
+      *)   rest="" ;;
+    esac
+  done
+  return 0
+}
+
+host_tmp() {
+  # BSD mktemp needs a template; `mktemp -d` alone is a GNU-ism that fails on
+  # macOS with a usage message, which is exactly the class of difference this
+  # repo keeps getting caught by.
+  mktemp -d "${TMPDIR:-/tmp}/thanhvan.XXXXXX"
+}
+
+# Everything the container sends is UNTRUSTED on the way out.
+#
+# It is the less-privileged side of the stream, but it is also the side this
+# script cannot see into, and a tar is a file format with a documented history of
+# writing outside the directory it was extracted into. Scan before extracting;
+# do not rely on tar's own stripping, which differs between GNU tar and the
+# bsdtar on macOS.
+scan_tar() {
+  local f="$1" bad=""
+  bad="$(tar -tf "$f" 2>/dev/null \
+         | grep -e '^/' -e '^\.\.$' -e '^\.\./' -e '/\.\./' -e '/\.\.$' \
+         | head -3)"
+  if [ -n "$bad" ]; then
+    die "the archive from the container names paths outside the destination." \
+        "$bad" \
+        "Nothing was written. This should not happen; the volume may be tampered with."
+  fi
+  bad="$(tar -tvf "$f" 2>/dev/null | grep -E '^[lh]' | head -3)"
+  if [ -n "$bad" ]; then
+    die "the archive from the container contains links, which are not copied out." \
+        "$bad"
+  fi
+  return 0
+}
+
+# host -> container. src is a host path; rel is relative to $CHOME.
+copy_in() {
+  local src="$1" rel="$2" mode="$3" force="$4"
+  check_rel "$rel"
+  [ -e "$src" ] || die "no such file or directory: $src"
+
+  if [ -d "$src" ]; then
+    [ "$TV_RECURSE" = "1" ] || die "'$src' is a directory." \
+      "Copy a directory with:  thanhvan container cp -r $src tv:$rel"
+    tar -cf - -C "$src" . | docker_run tv-cp puttar "$rel" "$force"
+    local rc=${PIPESTATUS[1]}
+    [ "$rc" -eq 0 ] || return "$rc"
+  else
+    [ -r "$src" ] || die "cannot read $src."
+    docker_run tv-cp put "$rel" "$mode" "$force" < "$src" || return $?
+  fi
+  return 0
+}
+
+# container -> host. rel is relative to $CHOME; dest is a host path.
+copy_out() {
+  local rel="$1" dest="$2" force="$3"
+  check_rel "$rel"
+
+  if [ "$TV_DRY_RUN" = "1" ]; then
+    docker_run tv-cp get "$rel" >/dev/null
+    return 0
+  fi
+
+  local kind
+  kind="$(docker_run tv-cp stat "$rel" 2>/dev/null | tr -d '\r')"
+  case "$kind" in
+    file|dir) ;;
+    *) die "'$rel' does not exist in the volume." \
+           "List what is there:  thanhvan container run ls -la" ;;
+  esac
+
+  # A destination that is an existing directory means "put it in here", which is
+  # what cp(1) does and what everybody expects.
+  if [ -d "$dest" ]; then dest="${dest%/}/$(basename "$rel")"; fi
+
+  if [ -e "$dest" ] && [ "$force" != "1" ]; then
+    die "$dest already exists." "Overwrite it with --force."
+  fi
+
+  # Checked here rather than discovered as a failed redirect below. Two causes
+  # with two different fixes: the volume not having the file, and this machine
+  # not having the directory. Reporting the second as the first sends people to
+  # look in the wrong place entirely.
+  local ddir; ddir="$(dirname "$dest")"
+  [ -d "$ddir" ] || die "the destination directory does not exist: $ddir" \
+                        "Create it first:  mkdir -p $ddir"
+
+  local tmp
+  if [ "$kind" = "file" ]; then
+    # Never write the destination directly: an interrupted copy must not leave a
+    # truncated file at a path something else is about to read.
+    tmp="$dest.thanhvan.$$"
+    if ! docker_run tv-cp get "$rel" > "$tmp"; then
+      rm -f "$tmp"; die "could not read '$rel' out of the volume."
+    fi
+    mv -f "$tmp" "$dest" || { rm -f "$tmp"; die "could not write $dest."; }
+  else
+    [ "$TV_RECURSE" = "1" ] || die "'$rel' is a directory." \
+      "Copy a directory with:  thanhvan container cp -r tv:$rel $dest"
+    local work; work="$(host_tmp)"
+    if ! docker_run tv-cp gettar "$rel" > "$work/x.tar"; then
+      rm -rf "$work"; die "could not read '$rel' out of the volume."
+    fi
+    scan_tar "$work/x.tar"
+    mkdir -p "$work/stage"
+    tar -xf "$work/x.tar" -C "$work/stage" || { rm -rf "$work"; die "could not extract '$rel'."; }
+    rm -rf "$dest"
+    mv "$work/stage" "$dest" || { rm -rf "$work"; die "could not write $dest."; }
+    rm -rf "$work"
+  fi
+  return 0
+}
+
+# --push / --pull. Both are PRE-VERB flags, and that is forced by the rule that
+# passthrough argv is never parsed: thanhvan cannot reach into
+# `gcloud ... --key-file=X` and rewrite X, so the user stages the file first and
+# names the container path themselves.
+#
+#   thanhvan --push ./sa.json gcloud auth activate-service-account \
+#            --key-file=data/sa.json
+#
+# resolves because the container's working directory is $CHOME and the push
+# landed at $CHOME/data/sa.json.
+push_one() {
+  local spec="$1" src dest
+  # Split at the LAST colon, so a host path containing one still works.
+  case "$spec" in
+    *:*) src="${spec%:*}"; dest="${spec##*:}" ;;
+    *)   src="$spec"; dest="" ;;
+  esac
+  [ -n "$src" ] || die "--push needs a host path." "e.g. --push ./sa.json:$DATA_DIR/sa.json"
+  [ -n "$dest" ] || dest="$DATA_DIR/$(basename "$src")"
+  say "push $src -> $dest"
+  copy_in "$src" "$dest" 0600 "$TV_FORCE"
+}
+
+pull_one() {
+  local spec="$1" rel dest
+  # Split at the FIRST colon here: the container side comes first, and container
+  # paths do not contain colons the way host paths sometimes do.
+  case "$spec" in
+    *:*) rel="${spec%%:*}"; dest="${spec#*:}" ;;
+    *)   rel="$spec"; dest="" ;;
+  esac
+  [ -n "$rel" ] || die "--pull needs a container path." "e.g. --pull $DATA_DIR/out.json:./out.json"
+  [ -n "$dest" ] || dest="./$(basename "$rel")"
+  say "pull $rel -> $dest"
+  copy_out "$rel" "$dest" "$TV_FORCE"
+}
+
+do_pushes() {
+  [ -n "$TV_PUSH" ] || return 0
+  local spec
+  while IFS= read -r spec; do
+    [ -n "$spec" ] || continue
+    push_one "$spec"
+  done <<EOF
+$TV_PUSH
+EOF
+}
+
+do_pulls() {
+  [ -n "$TV_PULL" ] || return 0
+  local spec
+  while IFS= read -r spec; do
+    [ -n "$spec" ] || continue
+    # A failed pull warns. It must NOT change the vendor's exit code; see
+    # run_passthrough. `( pull_one )` so a die inside exits only the subshell.
+    ( pull_one "$spec" ) || warn "--pull $spec did not complete."
+  done <<EOF
+$TV_PULL
+EOF
+  return 0
+}
+
+# --- container ------------------------------------------------------------
+
+cmd_container_cp() {
+  local -a rest
+  rest=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -r|-R|--recursive) TV_RECURSE=1; shift ;;
+      -f|--force)        TV_FORCE=1;   shift ;;
+      -*) die "unknown option '$1' for 'container cp'." \
+              "Try: thanhvan container cp [-r] [--force] SRC DST" ;;
+      *)  rest+=( "$1" ); shift ;;
+    esac
+  done
+
+  [ ${#rest[@]} -eq 2 ] || die "container cp takes exactly two paths." \
+    "Into the volume:   thanhvan container cp ./sa.json tv:$DATA_DIR/sa.json" \
+    "Out of the volume: thanhvan container cp tv:$DATA_DIR/out.json ./out.json"
+
+  local src="${rest[0]}" dst="${rest[1]}"
+  local src_tv=0 dst_tv=0
+  case "$src" in tv:*) src_tv=1 ;; esac
+  case "$dst" in tv:*) dst_tv=1 ;; esac
+
+  if [ "$src_tv" = "1" ] && [ "$dst_tv" = "1" ]; then
+    die "both paths are container paths." \
+        "Copy inside the volume with:  thanhvan container run cp ..."
+  fi
+  if [ "$src_tv" = "0" ] && [ "$dst_tv" = "0" ]; then
+    die "neither path names the container." \
+        "Prefix the container side with 'tv:'. This is not a host-to-host copy;" \
+        "for that, use cp(1)."
+  fi
+
+  require_docker
+  ensure_volume
+  require_image
+
+  if [ "$dst_tv" = "1" ]; then
+    copy_in "$src" "${dst#tv:}" 0600 "$TV_FORCE"
+  else
+    copy_out "${src#tv:}" "$dst" "$TV_FORCE"
+  fi
+}
+
+cmd_container() {
+  case "${1:-}" in
+    run)
+      shift
+      [ $# -gt 0 ] || die "container run needs a command." \
+                          "Try: thanhvan container run ls -la"
+      require_docker; ensure_volume; require_image
+      # THE BOUNDARY IS `run`. Everything after it is the container's argv,
+      # verbatim -- same rule as a vendor verb, for the same reason.
+      local -a TV_CMD
+      if [ "$TV_TAILNET" = "1" ]; then TV_CMD=( tv-net --proxy ) ; else TV_CMD=() ; fi
+      do_pushes
+      if [ ${#TV_CMD[@]} -eq 0 ]; then docker_run "$@"; else docker_run "${TV_CMD[@]}" "$@"; fi
+      local rc=$?
+      do_pulls
+      return $rc ;;
+    shell)
+      shift
+      [ $# -eq 0 ] || die "container shell takes no arguments." \
+                          "To run a command:  thanhvan container run $*"
+      cmd_container run bash ;;
+    cp)
+      shift; cmd_container_cp "$@" ;;
+    '') die "container what?" \
+            "  thanhvan container run <command...>" \
+            "  thanhvan container shell" \
+            "  thanhvan container cp [-r] [--force] SRC DST" ;;
+    *)  die "unknown container subcommand '$1'." \
+            "The subcommands are: run, shell, cp" ;;
+  esac
+}
+
+# --- import ---------------------------------------------------------------
+#
+# Convenience over `container cp`, and nothing more: each one knows the path its
+# tool reads and the mode that tool insists on. Both go through copy_in, so
+# there is still exactly one place a container is started.
+
+cmd_import() {
+  local target="${1:-}"
+  case "$target" in
+    ssh-key|kubeconfig) shift ;;
+    '') die "import what?" \
+            "  thanhvan import ssh-key    ~/.ssh/id_ed25519" \
+            "  thanhvan import kubeconfig ~/.kube/config" ;;
+    *)  die "cannot import '$target'." \
+            "The targets are: ssh-key, kubeconfig" ;;
+  esac
+
+  local src=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -f|--force) TV_FORCE=1; shift ;;
+      -*) die "unknown option '$1' for 'import $target'." ;;
+      *)  [ -z "$src" ] || die "import takes one host path."; src="$1"; shift ;;
+    esac
+  done
+  [ -n "$src" ] || die "import $target needs a host path." \
+    "e.g. thanhvan import $target ~/.ssh/id_ed25519"
+
+  require_docker; ensure_volume; require_image
+
+  case "$target" in
+    ssh-key)
+      local name; name="$(basename "$src")"
+      copy_in "$src" ".ssh/$name" 0600 "$TV_FORCE"
+      ok "installed $CHOME/.ssh/$name"
+      # The public half is not secret and is not required, but ssh-add and some
+      # servers want it, and copying it is free when it is sitting right there.
+      if [ -f "$src.pub" ]; then
+        copy_in "$src.pub" ".ssh/$name.pub" 0644 1
+        ok "installed $CHOME/.ssh/$name.pub"
+      fi
+      # thanhvan deliberately does not write ~/.ssh/config. A config file it
+      # half-owns is a file two things edit and neither understands.
+      case "$name" in
+        id_rsa|id_ecdsa|id_ed25519|id_dsa) ;;
+        *) bullet "Not a default key name, so name it explicitly:"
+           bullet "  thanhvan ssh -i ~/.ssh/$name user@host" ;;
+      esac ;;
+    kubeconfig)
+      copy_in "$src" ".kube/config" 0600 "$TV_FORCE"
+      ok "installed $CHOME/.kube/config"
+      bullet "Merging several kubeconfigs is out of scope; import the merged one." ;;
+  esac
+}
+
+# --- clean ----------------------------------------------------------------
+
+cmd_clean() {
+  require_docker; ensure_volume; require_image
+  heading "Clean"
+  bullet "Removes $CHOME/$DATA_DIR, where --push and 'container cp' put things."
+  bullet "Credentials live elsewhere in the volume and are not touched."
+  # confirm, not confirm_phrase: this is recoverable by pushing the files again.
+  # confirm_phrase is reserved for the volume delete, which is not.
+  if confirm "Remove everything under $CHOME/$DATA_DIR?" n; then
+    docker_run tv-cp clean "$DATA_DIR" && ok "removed $CHOME/$DATA_DIR"
+  else
+    skip "kept $CHOME/$DATA_DIR"
+  fi
+  return 0
+}
+
 # --- passthrough ----------------------------------------------------------
 
 is_verb() {
@@ -363,12 +756,27 @@ is_verb() {
   return 1
 }
 
-binary_for() {
-  # tailscale is the only verb whose binary is not itself: the CLI cannot do
-  # anything without a daemon, so it goes through a wrapper that starts one.
+# The container command for a verb, as an array, into TV_CMD.
+#
+# Two verbs are never run directly. `tailscale` cannot do anything without a
+# daemon, and `ssh` cannot reach a tailnet address without one -- the network
+# stack is inside the tailscaled process, so there is no kernel route to
+# 100.64.0.0/10 for connect(2) to use. Both go through tv-net, which starts one
+# daemon, runs the command and kills it again.
+#
+# --tailnet does the same for any other verb and additionally points HTTPS_PROXY
+# at tailscaled's SOCKS5 listener. That is deliberately opt-in: it routes ALL of
+# that command's traffic through the daemon, which is wrong for a kubectl aimed
+# at a public GKE endpoint. ssh needs no such flag because its routing is
+# per-host, in /etc/ssh/ssh_config.d.
+#
+# Bash 3.2 has no `local -n`, so this assigns a global rather than returning.
+container_cmd_for() {
   case "$1" in
-    tailscale) printf 'tv-tailscale' ;;
-    *)         printf '%s' "$1" ;;
+    tailscale) TV_CMD=( tv-net tailscale ) ;;
+    ssh)       TV_CMD=( tv-net ssh ) ;;
+    *) if [ "$TV_TAILNET" = "1" ]; then TV_CMD=( tv-net --proxy "$1" )
+       else TV_CMD=( "$1" ); fi ;;
   esac
 }
 
@@ -377,7 +785,23 @@ run_passthrough() {
   require_docker
   ensure_volume
   require_image
-  docker_run "$(binary_for "$verb")" "$@"
+
+  local -a TV_CMD
+  container_cmd_for "$verb"
+
+  do_pushes
+
+  docker_run "${TV_CMD[@]}" "$@"
+  local rc=$?
+
+  # RULE: THE VENDOR'S EXIT CODE PROPAGATES UNCHANGED.
+  #
+  # A --pull that fails warns and does not touch rc. Every script wrapping
+  # thanhvan reads that status as the vendor's, and a copy step quietly
+  # rewriting it is the kind of bug that only shows up in someone else's CI.
+  do_pulls
+
+  return $rc
 }
 
 # --- setup workstation ----------------------------------------------------
@@ -388,8 +812,10 @@ run_passthrough() {
 gcloud_account() { docker_run gcloud auth list --filter=status:ACTIVE --format="value(account)" 2>/dev/null | tr -d '\r'; }
 gcloud_adc_ok()  { docker_run gcloud auth application-default print-access-token >/dev/null 2>&1; }
 gh_login_name()  { docker_run gh api user --jq .login 2>/dev/null | tr -d '\r'; }
-ts_state()       { docker_run tv-tailscale status --json 2>/dev/null | tr -d '\r' | sed -n 's/.*"BackendState"[ ]*:[ ]*"\([A-Za-z]*\)".*/\1/p' | head -1; }
+ts_state()       { docker_run tv-net tailscale status --json 2>/dev/null | tr -d '\r' | sed -n 's/.*"BackendState"[ ]*:[ ]*"\([A-Za-z]*\)".*/\1/p' | head -1; }
 cf_cert_ok()     { docker_run test -f "$CHOME/.cloudflared/cert.pem" >/dev/null 2>&1; }
+ssh_keys()       { docker_run tv-cp ls .ssh 2>/dev/null | tr -d '\r' | grep -v '\.pub$' | grep -v '^known_hosts$' | grep -v '^config$'; }
+kubeconfig_ok()  { [ "$(docker_run tv-cp stat .kube/config 2>/dev/null | tr -d '\r')" = "file" ]; }
 
 setup_logins() {
   local interactive=1
@@ -467,6 +893,27 @@ setup_logins() {
     if [ "$interactive" = "1" ]; then
       docker_run cloudflared tunnel login || warn "cloudflared login did not complete."
     fi
+  fi
+
+  # These two are NOT logins. There is nothing to sign in to and nothing to
+  # prompt for -- a key and a kubeconfig are host files the user copies in when
+  # they have one. Reported, never attempted, and never a failure: a new joiner
+  # has neither, and rule 9 says that is not a broken command.
+  heading "SSH"
+  local keys; keys="$(ssh_keys)"
+  if [ -n "$keys" ]; then
+    ok "$(printf '%s\n' "$keys" | wc -l | tr -d ' ') key(s) in $CHOME/.ssh"
+  else
+    miss "no private key"
+    bullet "thanhvan import ssh-key ~/.ssh/id_ed25519"
+  fi
+
+  heading "Kubernetes"
+  if kubeconfig_ok; then
+    ok "kubeconfig present"
+  else
+    miss "no kubeconfig"
+    bullet "thanhvan import kubeconfig ~/.kube/config"
   fi
 }
 
@@ -556,7 +1003,7 @@ uninstall() {
 
 usage() {
   cat >&2 <<EOF
-${C_BOLD}thanhvan${C_OFF} -- one front door to gcloud, gh, tailscale and cloudflared.
+${C_BOLD}thanhvan${C_OFF} -- one front door to gcloud, gh, tailscale, cloudflared, ssh, kubectl.
 
 Every tool runs in a container. Nothing but Docker is installed on this machine,
 no host directory is mounted, and all credentials live in the '$(volume_name)'
@@ -568,13 +1015,25 @@ ${C_BOLD}usage${C_OFF}
   thanhvan gh          <args...>
   thanhvan tailscale   <args...>
   thanhvan cloudflared <args...>
+  thanhvan ssh         <args...>
+  thanhvan kubectl     <args...>
+
+  thanhvan container run <command...>       run anything in the container
+  thanhvan container shell                  an interactive shell in it
+  thanhvan container cp [-r] SRC DST        copy, one side prefixed 'tv:'
+  thanhvan import ssh-key    <hostpath>     -> $CHOME/.ssh/
+  thanhvan import kubeconfig <hostpath>     -> $CHOME/.kube/config
+  thanhvan clean                            empty $CHOME/$DATA_DIR
 
 ${C_BOLD}examples${C_OFF}
-  thanhvan setup workstation          pull the image and sign in to all four
+  thanhvan setup workstation          pull the image and sign in
   thanhvan gcloud projects list
   thanhvan gh pr list
   thanhvan tailscale status
-  thanhvan cloudflared tunnel list
+  thanhvan ssh admin@host.ts.net      tailnet hosts route automatically
+  thanhvan --tailnet kubectl get pods for an API server on the tailnet
+  thanhvan container cp ./sa.json tv:$DATA_DIR/sa.json
+  thanhvan container cp tv:$DATA_DIR/out.json ./out.json
 
 ${C_BOLD}options${C_OFF}
   Global flags go BEFORE the verb; everything after a verb belongs to that tool.
@@ -582,13 +1041,22 @@ ${C_BOLD}options${C_OFF}
   -n, --dry-run     print the docker command, start nothing
   -q, --quiet       only warnings and errors
   -y, --yes         assume yes (never accepts a typed-phrase confirmation)
+      --force       overwrite an existing destination when copying
+      --tailnet     bring the tailnet up and proxy this command through it
+      --push SRC[:DEST]   copy a host file in before running (DEST under $DATA_DIR/)
+      --pull SRC[:DEST]   copy a container file out afterwards
       --version     print the version
       --detect      print what this machine looks like, machine-readably
 
 ${C_BOLD}notes${C_OFF}
-  Because no host directory is mounted, flags that read a local file cannot see
-  it: 'thanhvan gcloud auth activate-service-account --key-file=./sa.json' will
-  not find sa.json. That is the direct cost of not touching your machine.
+  No host directory is mounted, so a flag that reads a local file cannot see it
+  on its own. Stage it first -- thanhvan reads the file here and streams it in;
+  the container never gets to look at your disk:
+
+    thanhvan --push ./sa.json gcloud auth activate-service-account \\
+             --key-file=$DATA_DIR/sa.json
+
+  Pushed files stay in the volume until 'thanhvan clean'.
 EOF
 }
 
@@ -615,6 +1083,12 @@ main() {
       -q|--quiet)   TV_QUIET=1;   shift ;;
       -y|--yes)     TV_YES=1;     shift ;;
       -v|--verbose) TV_TRACE=1;   shift ;;
+      --tailnet)    TV_TAILNET=1; shift ;;
+      --force)      TV_FORCE=1;   shift ;;
+      --push) [ $# -ge 2 ] || die "--push needs a host path."
+              TV_PUSH="$TV_PUSH${TV_PUSH:+$NL}$2"; shift 2 ;;
+      --pull) [ $# -ge 2 ] || die "--pull needs a container path."
+              TV_PULL="$TV_PULL${TV_PULL:+$NL}$2"; shift 2 ;;
       *) break ;;
     esac
   done
@@ -635,12 +1109,17 @@ main() {
         '') die "setup what?" "Try: thanhvan setup workstation" ;;
         *)  die "cannot set up '$1'." "The only target is: thanhvan setup workstation" ;;
       esac ;;
+    container) shift; cmd_container "$@" ;;
+    import)    shift; cmd_import "$@" ;;
+    clean)     shift
+               [ $# -eq 0 ] || die "clean takes no arguments." "Try: thanhvan clean"
+               cmd_clean ;;
     --version|-V) printf 'thanhvan %s\n' "$THANHVAN_VERSION" ;;
     --detect)     detect_report ;;
     --uninstall-shell-block) remove_shell_block ;;
     ''|--help|-h|help) usage ;;
     *) die "unknown command '$cmd'." \
-           "The tools are: gcloud, gh, tailscale, cloudflared" \
+           "The tools are: gcloud, gh, tailscale, cloudflared, ssh, kubectl" \
            "Try: thanhvan --help" ;;
   esac
 }
