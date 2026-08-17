@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
-# thanhvan -- one front door to gcloud, gh, tailscale, cloudflared, ssh, kubectl.
+# thanhvan -- one front door to gcloud, gh, tailscale, cloudflared, ssh, kubectl,
+# git, helm, jq and yq.
 #
 # This script IS the CLI. It installs nothing, authenticates nothing and knows
 # nothing about any of the four services; it composes one `docker run` and gets
@@ -46,7 +47,7 @@
 
 set -u
 
-THANHVAN_VERSION="0.6.0"
+THANHVAN_VERSION="0.7.0"
 
 IMAGE_REPO="ghcr.io/thanhvan-tech/thanhvan"
 DEFAULT_VOLUME="thanhvan-home"
@@ -67,10 +68,16 @@ UPDATE_BASE_URL="${THANHVAN_UPDATE_URL:-https://raw.githubusercontent.com/thanhv
 # security decision, not a convenience one.
 FORWARD_ENV="TERM NO_COLOR HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy"
 
-# The verbs. Each is a vendor CLI. `tailscale` and `ssh` are the two that need a
-# wrapper: the tailscale CLI is useless without a daemon, and ssh cannot reach a
-# tailnet address without one either. See docker/tv-net.sh.
-PASSTHROUGH_VERBS="gcloud gh tailscale cloudflared ssh kubectl"
+# The verbs. Each is a program in the image. `tailscale` and `ssh` are the two
+# that need a wrapper: the tailscale CLI is useless without a daemon, and ssh
+# cannot reach a tailnet address without one either. See docker/tv-net.sh.
+#
+# A name here is a name thanhvan will never pass to anything else, so adding one
+# is a decision about the boundary, not just about a tool. `run` and `shell` are
+# deliberately NOT here -- they are dispatched in main(), because a verb's argv
+# is untouched from the verb onward and `thanhvan run --dry-run ls` has to mean
+# `--dry-run` belongs to the container's command, not to us.
+PASSTHROUGH_VERBS="gcloud gh tailscale cloudflared ssh kubectl git helm jq yq"
 
 # Where --push lands and `container cp tv:...` defaults to. Relative to $CHOME,
 # which is also the container's working directory -- so a vendor command can
@@ -324,7 +331,7 @@ image_present() { docker image inspect "$(image_ref)" >/dev/null 2>&1; }
 require_image() {
   image_present && return 0
   [ "$TV_DRY_RUN" = "1" ] && return 0
-  # Deliberately does NOT pull. A silent ~700MB download in the middle of
+  # Deliberately does NOT pull. A silent ~800MB download in the middle of
   # `thanhvan gcloud config list` is not something anyone should have to work out
   # from a stalled terminal.
   die "the thanhvan tool image is not present ($(image_ref))." \
@@ -510,7 +517,7 @@ copy_out() {
   case "$kind" in
     file|dir) ;;
     *) die "'$rel' does not exist in the volume." \
-           "List what is there:  thanhvan container run ls -la" ;;
+           "List what is there:  thanhvan run ls -la" ;;
   esac
 
   # A destination that is an existing directory means "put it in here", which is
@@ -643,7 +650,7 @@ cmd_container_cp() {
 
   if [ "$src_tv" = "1" ] && [ "$dst_tv" = "1" ]; then
     die "both paths are container paths." \
-        "Copy inside the volume with:  thanhvan container run cp ..."
+        "Copy inside the volume with:  thanhvan run cp ..."
   fi
   if [ "$src_tv" = "0" ] && [ "$dst_tv" = "0" ]; then
     die "neither path names the container." \
@@ -667,7 +674,7 @@ cmd_container() {
     run)
       shift
       [ $# -gt 0 ] || die "container run needs a command." \
-                          "Try: thanhvan container run ls -la"
+                          "Try: thanhvan run ls -la"
       require_docker; ensure_volume; require_image
       # THE BOUNDARY IS `run`. Everything after it is the container's argv,
       # verbatim -- same rule as a vendor verb, for the same reason.
@@ -681,8 +688,12 @@ cmd_container() {
     shell)
       shift
       [ $# -eq 0 ] || die "container shell takes no arguments." \
-                          "To run a command:  thanhvan container run $*"
-      cmd_container run bash ;;
+                          "To run a command:  thanhvan run $*"
+      # tv-shell, not bash. It creates ~/.local/bin -- which the image puts on
+      # PATH and which is the only place a user-installed tool can survive a
+      # --rm container -- and it points bash at an rc file in /etc rather than
+      # one in the volume, which would be frozen at first install (rule 8).
+      cmd_container run tv-shell ;;
     cp)
       shift; cmd_container_cp "$@" ;;
     '') die "container what?" \
@@ -899,7 +910,12 @@ setup_logins() {
     miss "not logged in${state:+ ($state)}"
     bullet "The container joins the tailnet; this machine does not."
     if [ "$interactive" = "1" ]; then
-      docker_run tv-tailscale login || warn "Tailscale login did not complete."
+      # `tv-net tailscale`, not `tv-tailscale`. There is no such binary in the
+      # image, and this line named it for two releases: the CLI is a client for
+      # a daemon over a unix socket, so it needs tv-net to start one exactly the
+      # way the `tailscale` verb does. Nothing caught it because the whole path
+      # is interactive and the test stub exits 0 for any `docker run`.
+      docker_run tv-net tailscale login || warn "Tailscale login did not complete."
     fi
   fi
 
@@ -965,7 +981,7 @@ setup_workstation() {
   if [ "$do_pull" = "1" ] || ! image_present; then
     if [ "$do_pull" = "0" ]; then
       miss "image not present"
-      bullet "About 700MB, once. Everything the four CLIs need is in it."
+      bullet "About 800MB, once. Every tool thanhvan can run is in it."
     fi
     pull_image
   fi
@@ -1241,7 +1257,7 @@ cmd_update() {
       if docker image inspect "$new_image" >/dev/null 2>&1; then
         ok "image $new_image"
       else
-        say "  pulling $new_image (about 700MB, once)"
+        say "  pulling $new_image (about 800MB, once)"
         pull_image "$new_image"
         ok "image $new_image"
       fi
@@ -1267,7 +1283,8 @@ cmd_update() {
 
 usage() {
   cat >&2 <<EOF
-${C_BOLD}thanhvan${C_OFF} -- one front door to gcloud, gh, tailscale, cloudflared, ssh, kubectl.
+${C_BOLD}thanhvan${C_OFF} -- one front door to gcloud, gh, tailscale, cloudflared, ssh,
+kubectl, git, helm, jq and yq.
 
 Every tool runs in a container. Nothing but Docker is installed on this machine,
 no host directory is mounted, and all credentials live in the '$(volume_name)'
@@ -1275,17 +1292,17 @@ docker volume.
 
 ${C_BOLD}usage${C_OFF}
   thanhvan setup workstation [--skip-login] [--pull] [--uninstall]
-  thanhvan gcloud      <args...>
-  thanhvan gh          <args...>
-  thanhvan tailscale   <args...>
-  thanhvan cloudflared <args...>
+  thanhvan gcloud      <args...>      thanhvan git   <args...>
+  thanhvan gh          <args...>      thanhvan helm  <args...>
+  thanhvan tailscale   <args...>      thanhvan jq    <args...>
+  thanhvan cloudflared <args...>      thanhvan yq    <args...>
   thanhvan ssh         <args...>
   thanhvan kubectl     <args...>
 
   thanhvan update [--check] [--reinstall] [--no-image]
 
-  thanhvan container run <command...>       run anything in the container
-  thanhvan container shell                  an interactive shell in it
+  thanhvan run <command...>                 run anything in the container
+  thanhvan shell                            an interactive shell in it
   thanhvan container cp [-r] SRC DST        copy, one side prefixed 'tv:'
   thanhvan import ssh-key    <hostpath>     -> $CHOME/.ssh/
   thanhvan import kubeconfig <hostpath>     -> $CHOME/.kube/config
@@ -1302,6 +1319,7 @@ ${C_BOLD}examples${C_OFF}
   thanhvan --tailnet kubectl get pods for an API server on the tailnet
   thanhvan container cp ./sa.json tv:$DATA_DIR/sa.json
   thanhvan container cp tv:$DATA_DIR/out.json ./out.json
+  thanhvan shell                      install a tool of your own -- see notes
 
 ${C_BOLD}options${C_OFF}
   Global flags go BEFORE the verb; everything after a verb belongs to that tool.
@@ -1325,6 +1343,20 @@ ${C_BOLD}notes${C_OFF}
              --key-file=$DATA_DIR/sa.json
 
   Pushed files stay in the volume until 'thanhvan clean'.
+
+  For a tool that is not in the image: the container runs as a normal user with
+  no way to become root, so there is no apt and no sudo. Install it as yourself,
+  into ~/.local/bin -- that is on PATH and inside the volume, so it is still
+  there next time:
+
+    thanhvan shell
+    curl -fsSL <url> | tar -xz -C ~/.local/bin <name>
+    exit
+    thanhvan run <name> --version
+
+  Tools that ship with thanhvan take precedence over anything of the same name
+  in ~/.local/bin, so your own copy of kubectl cannot silently replace the one
+  'thanhvan kubectl' runs.
 EOF
 }
 
@@ -1379,6 +1411,13 @@ main() {
       esac ;;
     update)    shift; cmd_update "$@" ;;
     container) shift; cmd_container "$@" ;;
+    # Aliases for the two `container` subcommands people reach for constantly:
+    # `run` is how a tool the user installed themselves is invoked, and `shell`
+    # is how they install it. Dispatched HERE and not through PASSTHROUGH_VERBS
+    # -- a verb hands everything after itself to a program of that name, and
+    # there is no program called `run`.
+    run)       shift; cmd_container run "$@" ;;
+    shell)     shift; cmd_container shell "$@" ;;
     import)    shift; cmd_import "$@" ;;
     clean)     shift
                [ $# -eq 0 ] || die "clean takes no arguments." "Try: thanhvan clean"
@@ -1388,7 +1427,8 @@ main() {
     --uninstall-shell-block) remove_shell_block ;;
     ''|--help|-h|help) usage ;;
     *) die "unknown command '$cmd'." \
-           "The tools are: gcloud, gh, tailscale, cloudflared, ssh, kubectl" \
+           "The tools are: gcloud, gh, tailscale, cloudflared, ssh, kubectl, git, helm, jq, yq" \
+           "For anything else in the container:  thanhvan run $cmd" \
            "Try: thanhvan --help" ;;
   esac
 }
