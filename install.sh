@@ -142,7 +142,7 @@ main() {
   # --- install ------------------------------------------------------------
   # The launcher carries its own version, so there is exactly one place a
   # version is written down and no way for the two to disagree.
-  local version version_dir
+  local version version_dir sel=""
   version=$(grep -E '^THANHVAN_VERSION=' "$tmp/thanhvan" | head -1 | cut -d'"' -f2)
   [ -n "$version" ] || die "the downloaded launcher has no THANHVAN_VERSION. Refusing to install."
   version_dir="$share_dir/versions/$version"
@@ -151,11 +151,23 @@ main() {
   cp "$tmp/thanhvan" "$version_dir/bin/thanhvan"
   chmod +x "$version_dir/bin/thanhvan"
 
-  # Repoint `current` atomically. `ln -sfn` onto an EXISTING symlink-to-a-
-  # directory does not replace it -- it creates the link inside the target,
-  # leaving current/versions and a still-old current. Create then rename.
-  ln -sfn "versions/$version" "$share_dir/.current.$$"
-  mv -f "$share_dir/.current.$$" "$share_dir/current"
+  # Repoint `current`. THE -n IS THE WHOLE FLAG: without it, ln follows an
+  # existing `current` symlink to the directory it names and creates the new
+  # link INSIDE it, so `current` keeps selecting the old version and ln exits 0.
+  #
+  # Staging a link and `mv -f`ing it over `current` has the same bug -- mv stats
+  # the destination through the symlink and moves the link into the directory --
+  # and `mv -T` is a GNU-ism macOS does not have. This only ever bites on a
+  # RE-install, where `current` already exists, which is exactly the run people
+  # make to repair a broken one.
+  ln -sfn "versions/$version" "$share_dir/current"
+
+  # Read back where it points. The failure above is a silent no-op, and this
+  # installer's whole job is that the next command runs what it just installed.
+  sel=$(cd -P "$share_dir/current" 2>/dev/null && pwd) || sel=""
+  [ "$sel" = "$share_dir/versions/$version" ] || die "installed $version, but
+  $share_dir/current selects ${sel:-nothing}. Nothing will run the new version.
+  Remove $share_dir/current and re-run this installer."
 
   ln -sfn "../share/thanhvan/current/bin/thanhvan" "$bin_link"
   ok "thanhvan $version installed to $bin_link"

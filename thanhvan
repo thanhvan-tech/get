@@ -46,11 +46,18 @@
 
 set -u
 
-THANHVAN_VERSION="0.5.0"
+THANHVAN_VERSION="0.6.0"
 
 IMAGE_REPO="ghcr.io/thanhvan-tech/thanhvan"
 DEFAULT_VOLUME="thanhvan-home"
 CHOME="/home/thanhvan"
+
+# Where `thanhvan update` looks for a newer launcher: the SAME public channel
+# install/install.sh downloads from, verified the same way. install.sh is the
+# entire distribution channel, so an update path that checked less than the
+# install does would be a way around the install's verification -- available on
+# every machine that already has thanhvan. Public by design; no credentials.
+UPDATE_BASE_URL="${THANHVAN_UPDATE_URL:-https://raw.githubusercontent.com/thanhvan-tech/get/main}"
 
 # Host environment forwarded into the container. AN ALLOWLIST, and deliberately
 # tiny. Forwarding the environment wholesale would put whatever the host happens
@@ -83,6 +90,13 @@ TV_RECURSE=0
 # unset variable, and both of these are read on every passthrough call.
 TV_PUSH=""
 TV_PULL=""
+
+# cmd_update's scratch directory. GLOBAL on purpose, and this is not a style
+# choice: an EXIT trap fires AFTER the function that installed it has returned,
+# so a `local tmp` is already out of scope by then. Under `set -u` the trap
+# then aborts with "tmp: unbound variable" -- printed after a successful
+# update, looking like the update broke, having cleaned up nothing.
+TV_UPD_TMP=""
 NL='
 '
 
@@ -318,8 +332,12 @@ require_image() {
 }
 
 pull_image() {
-  if [ "$TV_DRY_RUN" = "1" ]; then say "dry-run: docker pull $(image_ref)"; return 0; fi
-  docker pull "$(image_ref)" || die "could not pull $(image_ref)." \
+  # Takes an explicit ref so `update` can pull the image for the version it just
+  # installed rather than for the one this process is running. Defaulted, so
+  # every existing caller means what it always did.
+  local ref="${1:-$(image_ref)}"
+  if [ "$TV_DRY_RUN" = "1" ]; then say "dry-run: docker pull $ref"; return 0; fi
+  docker pull "$ref" || die "could not pull $ref." \
     "If this is a private registry you are not logged in to:  docker login ghcr.io"
 }
 
@@ -999,6 +1017,252 @@ uninstall() {
   return 0
 }
 
+# --- self-update ----------------------------------------------------------
+#
+# The versioned install layout is what makes this safe, and is the only reason
+# a script can replace itself at all:
+#
+#   ~/.local/bin/thanhvan -> <share>/current/bin/thanhvan
+#                         -> <share>/versions/<v>/bin/thanhvan
+#
+# update NEVER writes to the file it is currently executing. It installs the new
+# launcher beside the old one under versions/<new>/ and flips `current` last, so
+# a failure anywhere before the flip leaves the previous version in place AND
+# still selected. Overwriting in place would instead corrupt a running bash --
+# which reads the script incrementally, so a rewritten tail is executed as if it
+# had always been there.
+
+sha256_of() {
+  # macOS has shasum, not sha256sum. Same split install.sh makes, for the same
+  # reason, and the reason this is a function rather than two inline branches.
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
+share_dir() {
+  # CLI_ROOT is <share>/versions/<v>, so <share> is two levels up.
+  #
+  # DERIVED, never assumed to be ~/.local/share/thanhvan: somebody who set
+  # XDG_DATA_HOME gets their own tree updated, and somebody whose layout does
+  # not look like the installer's gets told to re-run the installer instead of
+  # having a versions/ tree written into a directory that is not one.
+  local d=""
+  d=$(cd -P "$CLI_ROOT/../.." 2>/dev/null && pwd) || return 1
+  [ -d "$d/versions" ] || return 1
+  [ -L "$d/current" ]  || return 1
+  printf '%s' "$d"
+}
+
+cmd_update() {
+  local check_only=0 reinstall=0 want_image=1
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --check)     check_only=1; shift ;;
+      --reinstall) reinstall=1;  shift ;;
+      --no-image)  want_image=0; shift ;;
+      # Not --force: that is already a global flag meaning "overwrite the
+      # destination when copying". One flag with two meanings is unguessable.
+      *) die "unknown option '$1' for 'update'." \
+             "Try: thanhvan update [--check] [--reinstall] [--no-image]" ;;
+    esac
+  done
+
+  if [ "$TV_MODE" = "dev" ]; then
+    die "this is a git checkout, not an installed copy." \
+        "update replaces an installed launcher. Here, git is the update:" \
+        "" \
+        "  git -C $CLI_ROOT pull"
+  fi
+
+  command -v curl >/dev/null 2>&1 \
+    || die "curl is needed to check for updates, and is not on this machine."
+
+  local share=""
+  share=$(share_dir) || die "this install is not laid out the way update expects." \
+      "It looks for <dir>/versions/<version>/bin/thanhvan next to a 'current'" \
+      "symlink, and this launcher resolved to $CLI_ROOT." \
+      "" \
+      "  curl -fsSL $UPDATE_BASE_URL/install.sh | bash"
+
+  heading "Update"
+  ok "installed        $THANHVAN_VERSION"
+
+  TV_UPD_TMP="$(host_tmp)" || die "could not create a temporary directory."
+  # One trap covers every path out, including the die()s below, which exit
+  # rather than returning. It reads a GLOBAL -- see TV_UPD_TMP's declaration.
+  trap '[ -n "$TV_UPD_TMP" ] && rm -rf "$TV_UPD_TMP"' EXIT
+
+  say "  checking $UPDATE_BASE_URL"
+  curl -fsSL "$UPDATE_BASE_URL/thanhvan" -o "$TV_UPD_TMP/thanhvan" \
+    || die "could not download the launcher from $UPDATE_BASE_URL/thanhvan" \
+           "Nothing was changed."
+  curl -fsSL "$UPDATE_BASE_URL/thanhvan.sha256" -o "$TV_UPD_TMP/thanhvan.sha256" \
+    || die "could not download the checksum. Refusing to install unverified." \
+           "Nothing was changed."
+
+  # VERIFY BEFORE READING ANYTHING OUT OF IT, version string included. Every
+  # line below this point treats the file as trusted; nothing above it may.
+  local want="" got=""
+  want=$(awk '{print $1; exit}' "$TV_UPD_TMP/thanhvan.sha256")
+  got=$(sha256_of "$TV_UPD_TMP/thanhvan")
+  [ -n "$want" ] || die "the checksum file is empty. Refusing to install unverified." \
+                        "Nothing was changed."
+  [ "$want" = "$got" ] || die "checksum mismatch." \
+      "  expected $want" \
+      "  got      $got" \
+      "The download is corrupt or has been tampered with. Nothing was changed."
+
+  local new=""
+  new=$(grep -E '^THANHVAN_VERSION=' "$TV_UPD_TMP/thanhvan" | head -1 | cut -d'"' -f2)
+  [ -n "$new" ] || die "the downloaded launcher has no THANHVAN_VERSION." \
+                       "Refusing to install it. Nothing was changed."
+  # The version becomes a directory name. Checked even though the checksum has
+  # already passed, because the cost is one line and the failure is a write
+  # outside the versions/ tree.
+  case "$new" in
+    *[!A-Za-z0-9._-]*|.|..) die "the downloaded launcher reports an unusable version '$new'." \
+                                "Nothing was changed." ;;
+  esac
+  ok "published        $new"
+
+  # No version arithmetic, on purpose. The channel is the source of truth for
+  # what "latest" is; comparing two version strings correctly in bash 3.2 is a
+  # subtle job whose only payoff would be second-guessing it.
+  if [ "$new" = "$THANHVAN_VERSION" ] && [ "$reinstall" = "0" ]; then
+    ok "already up to date"
+    return 0
+  fi
+  if [ "$check_only" = "1" ]; then
+    say ""
+    bullet "Install it:  thanhvan update"
+    return 0
+  fi
+
+  local new_image="${THANHVAN_IMAGE:-$IMAGE_REPO:$new}"
+  if [ "$TV_DRY_RUN" = "1" ]; then
+    say "dry-run: install $new to $share/versions/$new/bin/thanhvan"
+    say "dry-run: point $share/current at versions/$new"
+    [ "$want_image" = "1" ] && say "dry-run: docker pull $new_image"
+    return 0
+  fi
+
+  # The launcher that is running was reached by walking symlinks from $0, which
+  # need not be the one `current` selects. If it is not, flipping `current` will
+  # not change what the next `thanhvan` runs -- and the update would report
+  # success while doing nothing the user can see.
+  local cur=""
+  cur=$(cd -P "$share/current" 2>/dev/null && pwd) || cur=""
+  if [ -n "$cur" ] && [ "$cur" != "$CLI_ROOT" ]; then
+    warn "the running launcher is $CLI_ROOT, but 'current' selects $cur."
+    bullet "Updating the tree anyway; if 'thanhvan' still reports the old version,"
+    bullet "reinstall:  curl -fsSL $UPDATE_BASE_URL/install.sh | bash"
+  fi
+
+  mkdir -p "$share/versions/$new/bin" \
+    || die "could not create $share/versions/$new/bin. Nothing was changed."
+
+  # STAGE UNDER A TEMPORARY NAME, THEN RENAME. Never `cp` onto the final path.
+  #
+  # With --reinstall, `$new` IS the running version, so that final path is the
+  # file this process is executing -- and `cp` writes THROUGH to the existing
+  # inode. bash reads a script incrementally and seeks back into it between
+  # top-level commands, so a rewritten file is executed as though it had always
+  # been that way: the rest of this function is read out of the NEW file at the
+  # OLD offset, mid-line. rename(2) swaps the directory entry instead and leaves
+  # the running inode alone, which is the whole reason update installs beside
+  # the old launcher rather than over it.
+  local staged="$share/versions/$new/bin/.thanhvan.$$"
+  cp "$TV_UPD_TMP/thanhvan" "$staged" \
+    || die "could not write $share/versions/$new/bin/thanhvan. Nothing was changed."
+  chmod +x "$staged" \
+    || { rm -f "$staged"
+         die "could not make the new launcher executable. Nothing was changed."; }
+
+  # It has to actually run BEFORE it is the one everybody gets, and before it
+  # takes the name anything else resolves. `--version` is the cheapest whole-file
+  # exercise there is: bash parses the entire script before executing a line of
+  # it, so a truncated or mangled launcher fails here rather than on somebody's
+  # next command. Verified while still staged, so a bad download never occupies
+  # the real path even for an instant -- with --reinstall that path is the only
+  # working launcher on the machine.
+  local reported=""
+  reported=$("$staged" --version 2>/dev/null) \
+    || { rm -f "$staged"
+         die "the newly downloaded launcher does not run. Nothing was changed."; }
+  case "$reported" in
+    "thanhvan $new") ;;
+    *) rm -f "$staged"
+       die "the new launcher reports '$reported', expected 'thanhvan $new'." \
+           "Nothing was changed." ;;
+  esac
+
+  mv -f "$staged" "$share/versions/$new/bin/thanhvan" \
+    || { rm -f "$staged"
+         die "could not install $share/versions/$new/bin/thanhvan. Nothing was changed."; }
+
+  # Repoint `current`. THE -n IS THE WHOLE FLAG: without it ln FOLLOWS the
+  # existing `current` symlink to the directory it names and creates the new
+  # link INSIDE it -- versions/<old>/current -- so `current` still selects the
+  # old version, and ln exits 0.
+  #
+  # Staging a link under a temporary name and `mv -f`ing it over `current` has
+  # EXACTLY the same bug for exactly the same reason: mv stats the destination
+  # through the symlink, sees a directory, and moves the staged link into it.
+  # `mv -T` avoids that and is a GNU-ism macOS does not have. Both spellings
+  # look atomic, both report success, and both leave an update that prints
+  # "thanhvan <new>" while the next command still runs the old one.
+  ln -sfn "versions/$new" "$share/current" \
+    || die "could not repoint 'current' to versions/$new." \
+           "versions/$new is installed; nothing else was changed."
+
+  # Read back what was just written, because the failure above is a SILENT
+  # no-op: the only way to tell it apart from success is to ask where `current`
+  # actually points now. Rule 11 -- a check reads the thing, not a proxy for it.
+  local sel=""
+  sel=$(cd -P "$share/current" 2>/dev/null && pwd) || sel=""
+  [ "$sel" = "$share/versions/$new" ] \
+    || die "'current' selects ${sel:-nothing} after being repointed at versions/$new." \
+           "The new launcher is installed but not selected, so 'thanhvan' still" \
+           "runs $THANHVAN_VERSION. Reinstall:" \
+           "  curl -fsSL $UPDATE_BASE_URL/install.sh | bash"
+
+  ok "thanhvan $new    ($share/current -> versions/$new)"
+
+  # The image is tagged per version, so the new launcher's image is a different
+  # tag that this machine does not have yet. Pulling it here is the difference
+  # between an update that finishes and one whose next command dies with "the
+  # image is not present" -- and unlike a passthrough command, the user asked
+  # for this and is watching it.
+  if [ "$want_image" = "1" ]; then
+    if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+      if docker image inspect "$new_image" >/dev/null 2>&1; then
+        ok "image $new_image"
+      else
+        say "  pulling $new_image (about 700MB, once)"
+        pull_image "$new_image"
+        ok "image $new_image"
+      fi
+    else
+      # Not fatal: the launcher IS updated, and that is what was asked for.
+      warn "docker is not reachable, so the image for $new was not pulled."
+      bullet "Get it when docker is up:  thanhvan setup workstation --pull"
+    fi
+  else
+    skip "--no-image; run 'thanhvan setup workstation --pull' to fetch it"
+  fi
+
+  # The old version is left in versions/ deliberately: it is a few tens of KB,
+  # and it is the only thing standing between a bad release and a machine with
+  # no working thanhvan on it.
+  heading "Done"
+  bullet "$THANHVAN_VERSION -> $new"
+  bullet "The previous version is kept at $share/versions/$THANHVAN_VERSION"
+  return 0
+}
+
 # --- usage ----------------------------------------------------------------
 
 usage() {
@@ -1018,6 +1282,8 @@ ${C_BOLD}usage${C_OFF}
   thanhvan ssh         <args...>
   thanhvan kubectl     <args...>
 
+  thanhvan update [--check] [--reinstall] [--no-image]
+
   thanhvan container run <command...>       run anything in the container
   thanhvan container shell                  an interactive shell in it
   thanhvan container cp [-r] SRC DST        copy, one side prefixed 'tv:'
@@ -1027,6 +1293,8 @@ ${C_BOLD}usage${C_OFF}
 
 ${C_BOLD}examples${C_OFF}
   thanhvan setup workstation          pull the image and sign in
+  thanhvan update                     upgrade to the latest published version
+  thanhvan update --check             say what is available, change nothing
   thanhvan gcloud projects list
   thanhvan gh pr list
   thanhvan tailscale status
@@ -1109,6 +1377,7 @@ main() {
         '') die "setup what?" "Try: thanhvan setup workstation" ;;
         *)  die "cannot set up '$1'." "The only target is: thanhvan setup workstation" ;;
       esac ;;
+    update)    shift; cmd_update "$@" ;;
     container) shift; cmd_container "$@" ;;
     import)    shift; cmd_import "$@" ;;
     clean)     shift
