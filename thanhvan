@@ -47,7 +47,7 @@
 
 set -u
 
-THANHVAN_VERSION="0.8.0"
+THANHVAN_VERSION="0.9.0"
 
 IMAGE_REPO="ghcr.io/thanhvan-tech/thanhvan"
 DEFAULT_VOLUME="thanhvan-home"
@@ -77,7 +77,7 @@ FORWARD_ENV="TERM NO_COLOR HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_prox
 # deliberately NOT here -- they are dispatched in main(), because a verb's argv
 # is untouched from the verb onward and `thanhvan run --dry-run ls` has to mean
 # `--dry-run` belongs to the container's command, not to us.
-PASSTHROUGH_VERBS="gcloud gh tailscale cloudflared ssh kubectl git helm jq yq"
+PASSTHROUGH_VERBS="gcloud gh tailscale cloudflared ssh kubectl git helm jq yq claude tofu"
 
 # Where --push lands and `container cp tv:...` defaults to. Relative to $CHOME,
 # which is also the container's working directory -- so a vendor command can
@@ -1292,12 +1292,12 @@ docker volume.
 
 ${C_BOLD}usage${C_OFF}
   thanhvan setup workstation [--skip-login] [--pull] [--uninstall]
-  thanhvan gcloud      <args...>      thanhvan git   <args...>
-  thanhvan gh          <args...>      thanhvan helm  <args...>
-  thanhvan tailscale   <args...>      thanhvan jq    <args...>
-  thanhvan cloudflared <args...>      thanhvan yq    <args...>
-  thanhvan ssh         <args...>
-  thanhvan kubectl     <args...>
+  thanhvan gcloud      <args...>      thanhvan git    <args...>
+  thanhvan gh          <args...>      thanhvan helm   <args...>
+  thanhvan tailscale   <args...>      thanhvan jq     <args...>
+  thanhvan cloudflared <args...>      thanhvan yq     <args...>
+  thanhvan ssh         <args...>      thanhvan claude <args...>
+  thanhvan kubectl     <args...>      thanhvan tofu   <args...>
 
   thanhvan update [--check] [--reinstall] [--no-image]
 
@@ -1315,6 +1315,8 @@ ${C_BOLD}examples${C_OFF}
   thanhvan gcloud projects list
   thanhvan gh pr list
   thanhvan tailscale status
+  thanhvan claude -p 'summarise this' a one-shot prompt, no session
+  thanhvan tofu plan                  runs in the VOLUME, not your cwd
   thanhvan ssh admin@host.ts.net      tailnet hosts route automatically
   thanhvan --tailnet kubectl get pods for an API server on the tailnet
   thanhvan container cp ./sa.json tv:$DATA_DIR/sa.json
@@ -1426,8 +1428,16 @@ main() {
     --detect)     detect_report ;;
     --uninstall-shell-block) remove_shell_block ;;
     ''|--help|-h|help) usage ;;
+    # The tool list below is DERIVED from PASSTHROUGH_VERBS, not spelled out.
+    # Spelled out, the two drifted apart the moment a verb was added, and the
+    # only symptom was an error message naming the wrong set of tools.
+    #
+    # The comment lives here rather than inside the `die` call: a `#` line in
+    # the middle of a `\`-continued command is not a comment, it swallows every
+    # remaining argument. `bash -n` still passes; the message just loses three
+    # of its four lines.
     *) die "unknown command '$cmd'." \
-           "The tools are: gcloud, gh, tailscale, cloudflared, ssh, kubectl, git, helm, jq, yq" \
+           "The tools are: ${PASSTHROUGH_VERBS// /, }" \
            "For anything else in the container:  thanhvan run $cmd" \
            "Try: thanhvan --help" ;;
   esac
