@@ -47,7 +47,7 @@
 
 set -u
 
-THANHVAN_VERSION="0.9.0"
+THANHVAN_VERSION="0.10.0"
 
 IMAGE_REPO="ghcr.io/thanhvan-tech/thanhvan"
 DEFAULT_VOLUME="thanhvan-home"
